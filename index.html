@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>ECO CRISIS — Save the Planet Prototype</title>
+<title>ECO CRISIS — Save the Planet</title>
 <link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Outfit:wght@400;600;700;800;900&display=swap" rel="stylesheet">
 <style>
 :root {
@@ -534,6 +534,7 @@ body::after {
         <div class="end-stat"><div class="end-stat-val" id="endWrong" style="color:var(--red)">0</div><div class="end-stat-label">Wrong</div></div>
         <div class="end-stat"><div class="end-stat-val" id="endBestStreak" style="color:var(--yellow)">0</div><div class="end-stat-label">Best Streak</div></div>
       </div>
+      <div id="endWaveInfo" style="font-size:0.8rem;color:var(--muted);font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:16px;margin-top:-8px"></div>
 
       <div class="name-input-wrap">
         <span class="name-label">Save your score — enter your name</span>
@@ -600,47 +601,78 @@ const VOCAB = [
 ];
 
 // ── DIFFICULTY CONFIG ──
+// heal: max HP restored per correct answer (shrinks as waves increase)
+// drain: base HP lost per 100ms tick (grows with waves)
+// dmg: HP lost on wrong answer
+// healDecayPerWave: heal reduces by this each wave (making late game harder)
+// drainScalePerWave: drain multiplied by this each wave
 const DIFF = {
-  easy:   { time: 12, drain: 0.05, dmg: 6,  heal: 8,  pts: 100, timeBonus: 5  },
-  medium: { time: 9,  drain: 0.08, dmg: 10, heal: 12, pts: 175, timeBonus: 8  },
-  hard:   { time: 6,  drain: 0.13, dmg: 16, heal: 18, pts: 300, timeBonus: 14 },
+  easy:   { time: 12, baseDrain: 0.04, dmg: 8,  baseHeal: 6,  pts: 100, timeBonus: 5,  healDecay: 0.5, drainScale: 1.18 },
+  medium: { time: 9,  baseDrain: 0.07, dmg: 13, baseHeal: 5,  pts: 175, timeBonus: 8,  healDecay: 0.7, drainScale: 1.22 },
+  hard:   { time: 6,  baseDrain: 0.11, dmg: 20, baseHeal: 3,  pts: 300, timeBonus: 14, healDecay: 1.0, drainScale: 1.28 },
 };
+// Wave = every 10 questions answered. Each wave: drain faster, heal less.
+// Even a perfect player hits ~0 heal around wave 6-8 on easy, wave 4-5 on hard.
 
-// ── CLOUD LEADERBOARD (jsonbin.io) ──
-// This is a shared public bin — everyone who plays sees the same leaderboard.
-// To use your own: create a free account at jsonbin.io, make a bin with [] as content,
-// then replace BIN_ID and add your X-Master-Key below.
-const BIN_ID = 'ecocrisis-shared'; // placeholder — auto-falls back to localStorage
+// ── CLOUD LEADERBOARD via Firebase Firestore REST ──
+// Uses a free Firestore project. Read is public; writes are open (no auth).
+// To use YOUR OWN: create a Firebase project, enable Firestore in test mode,
+// then replace FIREBASE_PROJECT below with your project ID.
+// The collection "scores" will be created automatically on first write.
+const FIREBASE_PROJECT = 'ecocrisis-leaderboard'; // ← replace with your Firebase project ID
+const FIRESTORE_BASE = `https://firestore.googleapis.com/v1/projects/${FIREBASE_PROJECT}/databases/(default)/documents`;
+
 let cloudScores = [];
 
 async function fetchCloudScores() {
   try {
-    const r = await fetch(`https://api.jsonbin.io/v3/b/${BIN_ID}/latest`, {
-      headers: { 'X-Bin-Meta': 'false' }
-    });
-    if (!r.ok) throw new Error('fetch failed');
+    const url = `${FIRESTORE_BASE}/scores?pageSize=20&orderBy=score%20desc`;
+    const r = await fetch(url);
+    if (!r.ok) throw new Error('firestore fetch failed');
     const data = await r.json();
-    cloudScores = Array.isArray(data) ? data : [];
+    const docs = data.documents || [];
+    cloudScores = docs.map(d => ({
+      name:   d.fields.name?.stringValue   || 'Anonymous',
+      score:  parseInt(d.fields.score?.integerValue || 0),
+      streak: parseInt(d.fields.streak?.integerValue || 0),
+      diff:   d.fields.diff?.stringValue   || '—',
+    })).sort((a,b) => b.score - a.score);
   } catch {
-    // fallback to localStorage
+    // Graceful fallback: show local scores
     cloudScores = JSON.parse(localStorage.getItem('ecocrisis_scores') || '[]');
   }
 }
 
 async function pushCloudScore(entry) {
-  // Merge, sort, trim to top 20
-  cloudScores.push(entry);
-  cloudScores.sort((a, b) => b.score - a.score);
-  cloudScores = cloudScores.slice(0, 20);
-  // Always persist locally as fallback
-  localStorage.setItem('ecocrisis_scores', JSON.stringify(cloudScores));
+  // Always save locally first
+  const local = JSON.parse(localStorage.getItem('ecocrisis_scores') || '[]');
+  local.push(entry);
+  local.sort((a,b) => b.score - a.score);
+  localStorage.setItem('ecocrisis_scores', JSON.stringify(local.slice(0, 20)));
+
+  // Push to Firestore (auto-ID document)
   try {
-    await fetch(`https://api.jsonbin.io/v3/b/${BIN_ID}`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json', 'X-Bin-Meta': 'false' },
-      body: JSON.stringify(cloudScores)
+    const body = {
+      fields: {
+        name:      { stringValue:  entry.name },
+        score:     { integerValue: String(entry.score) },
+        streak:    { integerValue: String(entry.streak) },
+        diff:      { stringValue:  entry.diff },
+        timestamp: { integerValue: String(Date.now()) },
+      }
+    };
+    const r = await fetch(`${FIRESTORE_BASE}/scores`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
     });
-  } catch { /* silent fail — local copy already saved */ }
+    if (!r.ok) throw new Error('write failed');
+    // Re-fetch so leaderboard is fresh with all players
+    await fetchCloudScores();
+  } catch {
+    // Firestore unavailable — merge local into cloudScores so UI still works
+    cloudScores = JSON.parse(localStorage.getItem('ecocrisis_scores') || '[]');
+  }
 }
 
 // ── STATE ──
@@ -653,6 +685,10 @@ let answered = false;
 let queue = [], qIdx = 0;
 let multiplier = 1;
 let gameRunning = false;
+let wave = 1;          // increases every 10 questions
+let questionsThisWave = 0;
+let currentDrain = 0;  // actual drain per tick (escalates)
+let currentHeal = 0;   // actual heal per correct (de-escalates)
 
 // ── PARTICLES ──
 const canvas = document.getElementById('particles');
@@ -703,7 +739,7 @@ function showCombo(text) {
 // ── DIFFICULTY ──
 function selectDiff(d) {
   diff = d; cfg = DIFF[d];
-  document.getElementById('drainRate').textContent = `-${cfg.drain}%`;
+  document.getElementById('drainRate').textContent = `-${cfg.baseDrain}%`;
   ['easy','medium','hard'].forEach(x => document.getElementById('diff-'+x).classList.toggle('selected', x===d));
 }
 
@@ -711,6 +747,9 @@ function selectDiff(d) {
 function startGame() {
   health = 100; score = 0; streak = 0; bestStreak = 0;
   numCorrect = 0; numWrong = 0; multiplier = 1; gameRunning = true;
+  wave = 1; questionsThisWave = 0;
+  currentDrain = cfg.baseDrain;
+  currentHeal  = cfg.baseHeal;
   queue = shuffle(VOCAB);
   qIdx = 0;
 
@@ -720,12 +759,28 @@ function startGame() {
 
   drainInterval = setInterval(()=>{
     if (!gameRunning) return;
-    health = Math.max(0, health - cfg.drain);
+    health = Math.max(0, health - currentDrain);
     updateHealth();
-    if (health <= 0) endGame(false);
+    if (health <= 0) endGame();
   }, 100);
 
   nextQuestion();
+}
+
+// Called every 10 questions — ramps up difficulty until heal hits 0
+function advanceWave() {
+  wave++;
+  questionsThisWave = 0;
+  currentDrain = cfg.baseDrain * Math.pow(cfg.drainScale, wave - 1);
+  currentHeal  = Math.max(0, cfg.baseHeal - cfg.healDecay * (wave - 1));
+  // Show wave notification in drain text briefly
+  const el = document.getElementById('drainRate');
+  el.textContent = `WAVE ${wave} ⬆`;
+  el.style.color = 'var(--orange)';
+  setTimeout(() => {
+    el.textContent = `-${currentDrain.toFixed(3)}%`;
+    el.style.color = '';
+  }, 2000);
 }
 
 // ── QUESTION ──
@@ -795,13 +850,15 @@ function checkAnswer(btn, chosen, correct) {
   if (chosen === correct) {
     btn.classList.add('correct');
     streak++; numCorrect++;
+    questionsThisWave++;
     if (streak > bestStreak) bestStreak = streak;
     multiplier = streak >= 8 ? 4 : streak >= 5 ? 3 : streak >= 3 ? 2 : 1;
 
     const timeBonus = Math.floor((timeLeft / totalTime) * cfg.timeBonus);
     const pts = Math.floor(cfg.pts * multiplier) + timeBonus * 10;
     score += pts;
-    health = Math.min(100, health + cfg.heal);
+    // Heal is capped by currentHeal — shrinks each wave until it's 0
+    health = Math.min(100, health + currentHeal);
 
     spawnParticle(cx, cy, '#00ff88');
     flash(document.getElementById('healFlash'), 'show', 250);
@@ -811,21 +868,26 @@ function checkAnswer(btn, chosen, correct) {
     else if (streak === 8) showCombo('UNSTOPPABLE x4! ⚡');
     else if (streak > 0 && streak % 10 === 0) showCombo('LEGEND! 🌟');
 
+    if (questionsThisWave >= 10) advanceWave();
+
   } else {
     btn.classList.add('wrong');
     streak = 0; numWrong++;
+    questionsThisWave++;
     multiplier = 1;
     health = Math.max(0, health - cfg.dmg);
 
     spawnParticle(cx, cy, '#ff3c3c');
     flash(document.getElementById('damageFlash'), 'show', 350);
     flash(document.getElementById('qCard'), 'wrong-flash', 500);
+
+    if (questionsThisWave >= 10) advanceWave();
   }
 
   updateHealth();
   updateScoreRow();
 
-  if (health <= 0) { endGame(false); return; }
+  if (health <= 0) { endGame(); return; }
 
   if (chosen === correct) flash(document.getElementById('qCard'), 'correct-flash', 400);
   setTimeout(nextQuestion, 900);
@@ -835,6 +897,7 @@ function timeOut(correctAnswer) {
   if (answered) return;
   answered = true;
   streak = 0; numWrong++; multiplier = 1;
+  questionsThisWave++;
   health = Math.max(0, health - cfg.dmg * 0.7);
 
   const btns = document.querySelectorAll('.opt');
@@ -842,7 +905,8 @@ function timeOut(correctAnswer) {
   flash(document.getElementById('damageFlash'), 'show', 400);
   updateHealth(); updateScoreRow();
 
-  if (health <= 0) { endGame(false); return; }
+  if (questionsThisWave >= 10) advanceWave();
+  if (health <= 0) { endGame(); return; }
   setTimeout(nextQuestion, 1000);
 }
 
@@ -879,25 +943,30 @@ function updateScoreRow() {
 }
 
 // ── END GAME ──
-function endGame(won) {
+function endGame() {
   gameRunning = false;
   clearInterval(drainInterval);
   clearInterval(timerInterval);
   clearInterval(questionTimer);
 
-  const survived = Math.round(health);
-  const verdicts = won
-    ? ['PLANET SAVED!','HERO!','INCREDIBLE!']
-    : survived > 40 ? ['SO CLOSE...','KEEP TRYING','ALMOST!']
-    : ['PLANET DESTROYED','CATASTROPHE','GAME OVER'];
+  const verdicts =
+    wave >= 8 ? ['LEGENDARY!', 'ECO MASTER!', 'INCREDIBLE!'] :
+    wave >= 5 ? ['WELL FOUGHT', 'HERO EFFORT', 'SO CLOSE...'] :
+                ['PLANET DESTROYED', 'CATASTROPHE', 'GAME OVER'];
 
-  document.getElementById('endPlanet').textContent = health > 60 ? '🌍' : health > 30 ? '🌫️' : '💀';
+  document.getElementById('endPlanet').textContent = health > 40 ? '🌍' : health > 15 ? '🌫️' : '💀';
   document.getElementById('endVerdict').textContent = rand(verdicts);
-  document.getElementById('endVerdict').style.color = health > 50 ? 'var(--green)' : health > 25 ? 'var(--orange)' : 'var(--red)';
+  document.getElementById('endVerdict').style.color = wave >= 8 ? 'var(--green)' : wave >= 5 ? 'var(--orange)' : 'var(--red)';
   document.getElementById('endScore').textContent = score.toLocaleString();
   document.getElementById('endCorrect').textContent = numCorrect;
   document.getElementById('endWrong').textContent = numWrong;
   document.getElementById('endBestStreak').textContent = bestStreak;
+  // Show wave reached in the streak slot label
+  const waveEl = document.getElementById('endBestStreak');
+  waveEl.textContent = bestStreak;
+  // Add wave info as subtitle
+  const waveInfo = document.getElementById('endWaveInfo');
+  if (waveInfo) waveInfo.textContent = `Wave ${wave} reached`;
 
   const prevBest = cloudScores.length ? cloudScores[0].score : 0;
   document.getElementById('newBest').classList.toggle('show', score > prevBest && score > 0);
@@ -907,14 +976,14 @@ function endGame(won) {
 
 async function saveAndRestart() {
   const name = document.getElementById('nameInput').value.trim() || 'Anonymous';
-  if (score > 0) await pushCloudScore({ name, score, streak: bestStreak, diff });
+  if (score > 0) await pushCloudScore({ name, score, streak: bestStreak, diff, wave });
   document.getElementById('nameInput').value = '';
   goStart();
 }
 
 async function showScores() {
   const name = document.getElementById('nameInput').value.trim() || 'Anonymous';
-  if (score > 0) await pushCloudScore({ name, score, streak: bestStreak, diff });
+  if (score > 0) await pushCloudScore({ name, score, streak: bestStreak, diff, wave });
   await fetchCloudScores();
   renderScores();
   showScreen('scoresScreen');
@@ -933,9 +1002,9 @@ function renderScores() {
         <div class="hs-rank ${medals[i]||''}">#${i+1}</div>
         <div>
           <div class="hs-name">${s.name}</div>
-          <div class="hs-detail">🔥 ${s.streak} streak · ${s.diff||'—'}</div>
+          <div class="hs-detail">🔥 ${s.streak} streak · Wave ${s.wave||1} · ${s.diff||'—'}</div>
         </div>
-        <div class="hs-score">${s.score.toLocaleString()}</div>
+        <div class="hs-score">${Number(s.score).toLocaleString()}</div>
       </div>
     `).join('');
 }
@@ -948,7 +1017,7 @@ function showScreen(id) {
 }
 
 // Init drain rate display
-document.getElementById('drainRate').textContent = `-${DIFF.easy.drain}%`;
+document.getElementById('drainRate').textContent = `-${DIFF.easy.baseDrain}%`;
 // Pre-load leaderboard on page open
 fetchCloudScores();</script>
 </body>
